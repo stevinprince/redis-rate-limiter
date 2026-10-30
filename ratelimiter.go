@@ -24,8 +24,14 @@ package ratelimiter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
 	"time"
+
+	"github.com/stevin/ratelimiter/internal/algorithms"
+	ipolicy "github.com/stevin/ratelimiter/internal/policy"
+	iredis "github.com/stevin/ratelimiter/internal/redis"
 )
 
 // AlgorithmType identifies a rate limiting algorithm.
@@ -62,6 +68,13 @@ var (
 	// ErrLimiterClosed is returned when operations are attempted after Close.
 	ErrLimiterClosed = errors.New("ratelimiter: limiter closed")
 )
+
+// defaultPolicy is used when no policy is specified in Config or per-call options.
+var defaultPolicy = Policy{
+	Algorithm: TokenBucket,
+	Rate:      100,
+	Window:    time.Minute,
+}
 
 // Config holds the configuration for creating a new [RateLimiter].
 type Config struct {
@@ -153,7 +166,15 @@ type Status struct {
 // RateLimiter is the main entry point for distributed rate limiting.
 // It is safe for concurrent use by multiple goroutines.
 type RateLimiter struct {
-	// unexported fields will be added during wiring (Step 9)
+	client        iredis.Client
+	policyMgr     *ipolicy.Manager
+	defaultPolicy Policy
+	keyPrefix     string
+	logger        *slog.Logger
+
+	algos map[AlgorithmType]algorithms.Algorithm
+
+	mu     sync.RWMutex
 	closed bool
 }
 
@@ -162,8 +183,70 @@ type RateLimiter struct {
 // It establishes a connection to Redis and validates the config.
 // The caller must call [RateLimiter.Close] when done to release resources.
 func New(cfg Config) (*RateLimiter, error) {
-	// TODO: implement in Step 9
-	return nil, nil
+	if cfg.RedisAddr == "" {
+		return nil, fmt.Errorf("%w: RedisAddr is required", ErrInvalidConfig)
+	}
+
+	keyPrefix := cfg.KeyPrefix
+	if keyPrefix == "" {
+		keyPrefix = "rl:"
+	}
+
+	defPolicy := defaultPolicy
+	if cfg.DefaultPolicy != nil {
+		defPolicy = *cfg.DefaultPolicy
+	}
+	if defPolicy.Algorithm == "" {
+		defPolicy.Algorithm = TokenBucket
+	}
+	if defPolicy.Rate <= 0 {
+		return nil, fmt.Errorf("%w: DefaultPolicy.Rate must be positive", ErrInvalidPolicy)
+	}
+	if defPolicy.Window <= 0 {
+		return nil, fmt.Errorf("%w: DefaultPolicy.Window must be positive", ErrInvalidPolicy)
+	}
+
+	ctx := context.Background()
+	client, err := iredis.NewClient(ctx, iredis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+		DB:       cfg.RedisDB,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrRedisUnavailable, err)
+	}
+
+	cacheTTL := cfg.PolicyCacheTTL
+	if cacheTTL <= 0 {
+		cacheTTL = time.Minute
+	}
+
+	policyMgr := ipolicy.NewManager(ipolicy.Options{
+		Client:    client,
+		KeyPrefix: keyPrefix,
+		CacheTTL:  cacheTTL,
+	})
+
+	algoMap := map[AlgorithmType]algorithms.Algorithm{
+		TokenBucket:   algorithms.NewTokenBucket(client),
+		SlidingWindow: algorithms.NewSlidingWindow(client),
+		FixedWindow:   algorithms.NewFixedWindow(client),
+		LeakyBucket:   algorithms.NewLeakyBucket(client),
+	}
+
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(discardHandler{})
+	}
+
+	return &RateLimiter{
+		client:        client,
+		policyMgr:     policyMgr,
+		defaultPolicy: defPolicy,
+		keyPrefix:     keyPrefix,
+		logger:        logger,
+		algos:         algoMap,
+	}, nil
 }
 
 // Allow checks whether a request identified by key is allowed under the
@@ -174,39 +257,206 @@ func New(cfg Config) (*RateLimiter, error) {
 //
 // Options can override the policy or request cost for this call.
 func (rl *RateLimiter) Allow(ctx context.Context, key string, opts ...Option) (*Result, error) {
-	// TODO: implement in Step 9
-	return nil, nil
+	if err := rl.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	o := resolveOptions(opts)
+
+	pol := rl.defaultPolicy
+	if o.policy != nil {
+		pol = *o.policy
+	}
+	if pol.Algorithm == "" {
+		pol.Algorithm = TokenBucket
+	}
+
+	algo, ok := rl.algos[pol.Algorithm]
+	if !ok {
+		return nil, fmt.Errorf("%w: unknown algorithm %q", ErrInvalidPolicy, pol.Algorithm)
+	}
+
+	fullKey := rl.keyPrefix + key
+
+	params := toParams(pol, o.cost)
+
+	rl.logger.Debug("rate limit check",
+		"key", key,
+		"algorithm", pol.Algorithm,
+		"rate", pol.Rate,
+		"cost", o.cost,
+	)
+
+	res, err := algo.Allow(ctx, fullKey, params)
+	if err != nil {
+		return nil, err
+	}
+
+	return fromAlgoResult(res), nil
 }
 
 // GetStatus returns the current rate limit status for the given key without
 // consuming a request.
 func (rl *RateLimiter) GetStatus(ctx context.Context, key string) (*Status, error) {
-	// TODO: implement in Step 9
-	return nil, nil
+	if err := rl.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	pol := rl.defaultPolicy
+	algo := rl.algos[pol.Algorithm]
+
+	fullKey := rl.keyPrefix + key
+	params := toParams(pol, 0)
+
+	st, err := algo.Status(ctx, fullKey, params)
+	if err != nil {
+		return nil, err
+	}
+
+	return fromAlgoStatus(st), nil
 }
 
 // Reset clears the rate limit state for the given key, restoring the full quota.
 func (rl *RateLimiter) Reset(ctx context.Context, key string) error {
-	// TODO: implement in Step 9
+	if err := rl.checkClosed(); err != nil {
+		return err
+	}
+
+	fullKey := rl.keyPrefix + key
+
+	// Reset across all algorithms since we don't know which was used
+	for _, algo := range rl.algos {
+		if err := algo.Reset(ctx, fullKey); err != nil {
+			return err
+		}
+	}
+
+	rl.logger.Debug("rate limit reset", "key", key)
 	return nil
 }
 
 // Close releases all resources held by the RateLimiter, including the Redis
 // connection. After Close is called, all other methods return [ErrLimiterClosed].
 func (rl *RateLimiter) Close() error {
-	// TODO: implement in Step 9
-	return nil
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if rl.closed {
+		return ErrLimiterClosed
+	}
+	rl.closed = true
+
+	rl.logger.Debug("rate limiter closing")
+	return rl.client.Close()
 }
 
 // SetPolicy registers a named policy that can be referenced later.
 // The policy is cached locally and stored in Redis so all instances share it.
-func (rl *RateLimiter) SetPolicy(name string, policy Policy) error {
-	// TODO: implement in Step 9
-	return nil
+func (rl *RateLimiter) SetPolicy(name string, p Policy) error {
+	if err := rl.checkClosed(); err != nil {
+		return err
+	}
+	if p.Rate <= 0 || p.Window <= 0 {
+		return fmt.Errorf("%w: Rate and Window must be positive", ErrInvalidPolicy)
+	}
+
+	internal := toInternalPolicy(p)
+	return rl.policyMgr.Set(context.Background(), name, internal)
 }
 
 // GetPolicy retrieves a previously registered named policy.
 func (rl *RateLimiter) GetPolicy(name string) (*Policy, error) {
-	// TODO: implement in Step 9
-	return nil, nil
+	if err := rl.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	internal, found, err := rl.policyMgr.Get(context.Background(), name)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %q", ErrPolicyNotFound, name)
+	}
+
+	p := fromInternalPolicy(internal)
+	return &p, nil
 }
+
+// checkClosed returns ErrLimiterClosed if the limiter has been closed.
+func (rl *RateLimiter) checkClosed() error {
+	rl.mu.RLock()
+	defer rl.mu.RUnlock()
+	if rl.closed {
+		return ErrLimiterClosed
+	}
+	return nil
+}
+
+// toParams converts a public Policy and cost into internal algorithm Params.
+func toParams(p Policy, cost int) algorithms.Params {
+	if cost <= 0 {
+		cost = 1
+	}
+	return algorithms.Params{
+		Rate:       p.Rate,
+		Window:     p.Window,
+		Burst:      p.Burst,
+		RefillRate: p.RefillRate,
+		DrainRate:  p.DrainRate,
+		Cost:       cost,
+	}
+}
+
+// fromAlgoResult converts an internal algorithm Result to the public Result.
+func fromAlgoResult(r *algorithms.Result) *Result {
+	return &Result{
+		Allowed:    r.Allowed,
+		Remaining:  r.Remaining,
+		ResetAt:    time.Unix(r.ResetAtUnix, 0),
+		RetryAfter: time.Duration(r.RetryAfterMs) * time.Millisecond,
+		Limit:      r.Limit,
+	}
+}
+
+// fromAlgoStatus converts an internal algorithm Status to the public Status.
+func fromAlgoStatus(s *algorithms.Status) *Status {
+	return &Status{
+		Remaining: s.Remaining,
+		Limit:     s.Limit,
+		ResetAt:   time.Unix(s.ResetAtUnix, 0),
+		Used:      s.Used,
+	}
+}
+
+// toInternalPolicy converts a public Policy to the internal policy type.
+func toInternalPolicy(p Policy) ipolicy.Policy {
+	return ipolicy.Policy{
+		Algorithm:  string(p.Algorithm),
+		Rate:       p.Rate,
+		Window:     p.Window,
+		Burst:      p.Burst,
+		RefillRate: p.RefillRate,
+		DrainRate:  p.DrainRate,
+	}
+}
+
+// fromInternalPolicy converts an internal policy type to a public Policy.
+func fromInternalPolicy(p ipolicy.Policy) Policy {
+	return Policy{
+		Algorithm:  AlgorithmType(p.Algorithm),
+		Rate:       p.Rate,
+		Window:     p.Window,
+		Burst:      p.Burst,
+		RefillRate: p.RefillRate,
+		DrainRate:  p.DrainRate,
+	}
+}
+
+// discardHandler is a slog.Handler that discards all log records.
+// Used when no logger is configured.
+type discardHandler struct{}
+
+func (discardHandler) Enabled(context.Context, slog.Level) bool  { return false }
+func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
+func (d discardHandler) WithAttrs([]slog.Attr) slog.Handler      { return d }
+func (d discardHandler) WithGroup(string) slog.Handler            { return d }
